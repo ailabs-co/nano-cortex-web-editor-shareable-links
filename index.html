@@ -97,7 +97,7 @@
 
     .toolbar {
       display: grid;
-      grid-template-columns: 190px 140px 1fr 360px;
+      grid-template-columns: 190px 140px 140px 1fr 360px;
       gap: 18px;
       align-items: center;
     }
@@ -310,6 +310,46 @@
       .top-row { grid-template-columns: 1fr; }
       .chain { grid-template-columns: repeat(5, 230px); }
     }
+
+    .share-banner {
+      position: fixed;
+      top: 74px;
+      right: 24px;
+      width: 340px;
+      max-width: calc(100vw - 48px);
+      z-index: 50;
+      background: linear-gradient(180deg, rgba(23, 25, 27, 0.98), rgba(9, 10, 11, 0.98));
+      border: 1px solid var(--cyan);
+      border-radius: 10px;
+      padding: 16px;
+      box-shadow: 0 12px 34px rgba(0, 0, 0, 0.55);
+    }
+
+    .share-banner-header {
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      color: var(--cyan);
+      margin-bottom: 10px;
+    }
+
+    .share-banner-name { color: var(--text); font-size: 15px; font-weight: 650; margin-bottom: 8px; }
+
+    .share-banner-row { font-size: 12px; color: var(--muted); margin-top: 5px; line-height: 1.4; }
+    .share-banner-row span { color: var(--text); }
+
+    .share-banner-note {
+      font-size: 11px;
+      color: #8f8f8f;
+      line-height: 1.45;
+      margin-top: 12px;
+      padding-top: 10px;
+      border-top: 1px solid #24272a;
+    }
+
+    .share-banner-actions { margin-top: 14px; display: flex; gap: 10px; }
+    .share-banner-actions button { flex: 1; padding: 8px 10px; }
   </style>
 </head>
 <body>
@@ -328,9 +368,25 @@
     <section class="toolbar">
       <button id="connectBtn" class="primary">Connect</button>
       <button id="saveBtn" class="primary">Save</button>
+      <button id="shareBtn" class="primary">Share</button>
       <span></span>
       <div class="preset-wrap"><label for="presetSelect">Preset</label><select id="presetSelect"></select></div>
     </section>
+
+    <div id="shareBanner" class="share-banner" hidden>
+      <div class="share-banner-header">Shared Preset Detected</div>
+      <div class="share-banner-name" id="sbName">—</div>
+      <div class="share-banner-row">Firmware: <span id="sbFw">—</span></div>
+      <div class="share-banner-row">Capture: <span id="sbCapture">—</span></div>
+      <div class="share-banner-row">Cab/IR: <span id="sbIR">—</span></div>
+      <div class="share-banner-note">
+        Capture/IR info is shown for reference only and is never applied automatically — verify it against your own device library.
+      </div>
+      <div class="share-banner-actions">
+        <button id="shareBannerLoad" class="primary btn-small">Load into editor</button>
+        <button id="shareBannerDiscard" class="btn-small">Discard</button>
+      </div>
+    </div>
 
     <section class="top-row">
 
@@ -443,6 +499,11 @@
     const C305_UUID = '0000c305-0000-1000-8000-00805f9b34fb';
 
     const FX_BLOCK_KEYS = ['pre1', 'pre2', 'post1', 'post2', 'post3'];
+
+    // Informational-only firmware tag stamped on share links (see footer "Tested firmware").
+    // Never gates whether a shared preset can be loaded (see decodePreset).
+    const APP_FW_VERSION = '2.2.1';
+    const SHARE_PAYLOAD_VERSION = 1;
 
     const DELAY_SYNC_NOTES_FULL = [
       '1/64T', '1/64', '1/32T', '1/64D', '1/32',
@@ -2910,15 +2971,271 @@ function renderGate() {
       }
     }
 
+    // ---------------------------------------------------------------------
+    // Shareable links
+    //
+    // Encodes the current in-memory `state` (amp, gate, capture/IR metadata,
+    // FX blocks) into a compact string carried in the URL fragment (`#p=...`),
+    // and decodes/validates such a link back into a previewable payload.
+    //
+    // Nothing in this section may write to the device: no writeC304 call, and
+    // no call into any of the setFX*/setGate*/savePreset device-write helpers.
+    // Applying a shared preset only ever mutates `state` and re-renders the UI.
+    // ---------------------------------------------------------------------
+
+    let pendingSharedPreset = null;
+
+    function buildSharePayload() {
+      const presetName = state.presetNames.get(state.selectedPreset) || ('Preset ' + state.selectedPreset);
+
+      const amp = {
+        gain: state.amp.gain,
+        level: state.amp.level,
+        bass: state.amp.bass,
+        mid: state.amp.mid,
+        treble: state.amp.treble
+      };
+
+      const reductionParam = state.gate.params && state.gate.params[0];
+      const gate = {
+        on: !!state.gate.on,
+        reduction: reductionParam ? Number(reductionParam.value) : 0
+      };
+
+      const capture = {
+        name: state.currentCapture.name || '',
+        slot: state.capture.selectedSlot != null ? state.capture.selectedSlot : null
+      };
+
+      const cabIR = {
+        name: state.currentIR.fullName || state.currentIR.shortName || '',
+        slot: state.cabIR.selectedSlot != null ? state.cabIR.selectedSlot : null,
+        mic: state.cabIR.mic,
+        position: state.cabIR.position,
+        levelDb: state.cabIR.levelDb,
+        hpf: state.cabIR.highPassHz,
+        lpf: state.cabIR.lowPassHz
+      };
+
+      const blocks = {};
+      FX_BLOCK_KEYS.forEach(key => {
+        const block = state.blocks[key];
+        const params = {};
+        (block.params || []).forEach(p => { params[p.name] = p.value; });
+        blocks[key] = { model: block.model, on: !!block.on, params };
+      });
+
+      return {
+        v: SHARE_PAYLOAD_VERSION,
+        fw: APP_FW_VERSION,
+        name: presetName,
+        amp,
+        gate,
+        capture,
+        cabIR,
+        blocks
+      };
+    }
+
+    function encodePreset(payload) {
+      const json = JSON.stringify(payload);
+      const bytes = new TextEncoder().encode(json);
+      let binary = '';
+      bytes.forEach(b => { binary += String.fromCharCode(b); });
+      const base64 = btoa(binary);
+      return base64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    }
+
+    function decodePreset(encoded) {
+      if (!encoded || typeof encoded !== 'string') throw new Error('Empty shared preset payload');
+
+      let base64 = encoded.replace(/-/g, '+').replace(/_/g, '/');
+      const paddingNeeded = (4 - (base64.length % 4)) % 4;
+      base64 += '='.repeat(paddingNeeded);
+
+      const binary = atob(base64);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+
+      const json = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+      const payload = JSON.parse(json);
+
+      if (!payload || typeof payload !== 'object') throw new Error('Shared preset payload is not an object');
+      if (payload.v !== SHARE_PAYLOAD_VERSION) throw new Error('Unsupported shared preset version: ' + payload.v);
+
+      return payload;
+    }
+
+    async function sharePreset() {
+      try {
+        const payload = buildSharePayload();
+        const encoded = encodePreset(payload);
+        const url = location.origin + location.pathname + '#p=' + encoded;
+
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          await navigator.clipboard.writeText(url);
+          log('Share link copied to clipboard.');
+        } else {
+          log('Clipboard unavailable - share link: ' + url);
+        }
+      } catch (err) {
+        log('ERROR: failed to build share link: ' + err);
+      }
+    }
+
+    function clampParamValueByMeta(rawValue, meta) {
+      if (!meta) return rawValue;
+
+      if (meta.kind === 'enum') {
+        const index = Math.round(Number(rawValue));
+        if (!Number.isFinite(index)) return 0;
+        return clamp(index, 0, meta.options.length - 1);
+      }
+
+      const num = Number(rawValue);
+      if (!Number.isFinite(num)) return meta.min;
+      return clamp(roundToStep(num, meta.step || 0.1), meta.min, meta.max);
+    }
+
+    // Looks up blockData.model against `models` (a block's allowed model list).
+    // Returns a cleaned { model, on, params } using the model's own default
+    // params/meta as the shape, with payload values clamped on top - or null
+    // if the model name is unrecognized (caller must leave the block as-is).
+    function validateAndClampBlock(blockKey, blockData, models) {
+      if (!blockData || typeof blockData !== 'object') return null;
+      if (!Array.isArray(models)) return null;
+
+      const modelDef = models.find(m => m.name === blockData.model);
+      if (!modelDef) return null;
+
+      const cleanParams = structuredClone(modelDef.params || []);
+      const incomingParams = (blockData.params && typeof blockData.params === 'object') ? blockData.params : {};
+
+      cleanParams.forEach(param => {
+        if (!Object.prototype.hasOwnProperty.call(incomingParams, param.name)) return;
+        param.value = clampParamValueByMeta(incomingParams[param.name], param.meta);
+      });
+
+      return {
+        model: modelDef.name,
+        on: !!blockData.on,
+        params: cleanParams
+      };
+    }
+
+    function checkURLForSharedPreset() {
+      const hash = location.hash || '';
+      const match = hash.match(/[#&]p=([^&]*)/);
+      if (!match) return;
+
+      try {
+        const payload = decodePreset(match[1]);
+        showSharedPresetBanner(payload);
+      } catch (err) {
+        log('ERROR: invalid or corrupt shared preset link: ' + err);
+      } finally {
+        history.replaceState(null, '', location.pathname + location.search);
+      }
+    }
+
+    function showSharedPresetBanner(payload) {
+      pendingSharedPreset = payload;
+
+      $('sbName').textContent = payload.name || 'Untitled preset';
+      $('sbFw').textContent = payload.fw || '—';
+
+      const capture = payload.capture || {};
+      $('sbCapture').textContent = capture.name
+        ? capture.name + (capture.slot != null ? ' (slot ' + capture.slot + ')' : '')
+        : '—';
+
+      const cabIR = payload.cabIR || {};
+      const irParts = [];
+      if (cabIR.name) irParts.push(cabIR.name);
+      if (cabIR.mic) irParts.push(cabIR.mic);
+      if (cabIR.position != null) irParts.push('pos ' + cabIR.position);
+      $('sbIR').textContent = irParts.length ? irParts.join(' · ') : '—';
+
+      $('shareBanner').hidden = false;
+      log('Shared preset link detected: "' + (payload.name || 'Untitled preset') + '"');
+    }
+
+    function hideSharedPresetBanner() {
+      $('shareBanner').hidden = true;
+    }
+
+    // Mutates state.amp / state.gate / state.blocks[*] in place from a validated
+    // shared payload, then re-renders. Never touches state.capture/state.cabIR
+    // (those are display-only in the banner) and never issues a device write.
+    function applySharedPreset(payload) {
+      if (!payload) return;
+
+      if (payload.amp && typeof payload.amp === 'object') {
+        ['gain', 'level', 'bass', 'mid', 'treble'].forEach(key => {
+          const raw = Number(payload.amp[key]);
+          if (Number.isFinite(raw)) state.amp[key] = clamp(Math.round(raw), 0, 255);
+        });
+      }
+
+      if (payload.gate && typeof payload.gate === 'object') {
+        state.gate.on = !!payload.gate.on;
+        const reductionParam = state.gate.params && state.gate.params[0];
+        if (reductionParam) {
+          const raw = Number(payload.gate.reduction);
+          if (Number.isFinite(raw)) {
+            reductionParam.value = clamp(raw, reductionParam.meta.min, reductionParam.meta.max);
+          }
+        }
+      }
+
+      const blocksPayload = (payload.blocks && typeof payload.blocks === 'object') ? payload.blocks : {};
+      FX_BLOCK_KEYS.forEach(key => {
+        const blockData = blocksPayload[key];
+        if (!blockData) return;
+
+        const block = state.blocks[key];
+        const cleaned = validateAndClampBlock(key, blockData, block.models);
+
+        if (!cleaned) {
+          log('Shared preset: unrecognized model "' + (blockData && blockData.model) + '" for ' + key + ' - block left unchanged.');
+          return;
+        }
+
+        block.model = cleaned.model;
+        block.on = cleaned.on;
+        block.params = cleaned.params;
+      });
+
+      render();
+
+      log('Preset loaded into the editor. Connect your Nano Cortex, select a preset slot, then click Save to write these values to the device.');
+    }
+
     $('connectBtn').addEventListener('click', connectAll);
     $('refreshBtn').addEventListener('click', refreshLists);
     $('disconnectBtn').addEventListener('click', disconnect);
     $('saveBtn').addEventListener('click', savePreset);
+    $('shareBtn').addEventListener('click', sharePreset);
     $('presetSelect').addEventListener('change', e => selectPreset(Number(e.target.value)));
+
+    $('shareBannerDiscard').addEventListener('click', () => {
+      pendingSharedPreset = null;
+      hideSharedPresetBanner();
+      log('Shared preset discarded.');
+    });
+
+    $('shareBannerLoad').addEventListener('click', () => {
+      if (!pendingSharedPreset) return;
+      const toApply = pendingSharedPreset;
+      pendingSharedPreset = null;
+      hideSharedPresetBanner();
+      applySharedPreset(toApply);
+    });
 
     if (!navigator.bluetooth) $('unsupported').style.display = 'block';
 
     render();
+    checkURLForSharedPreset();
     log('Prototype loaded.');
     log('Protocol mode: manual sync + protobuf FE metadata parser + current-state UI update + typed parameter UI');
   </script>
